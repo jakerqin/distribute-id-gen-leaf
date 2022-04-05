@@ -159,7 +159,9 @@ public class SegmentIDGenImpl implements IDGen {
         StopWatch sw = new Slf4JStopWatch();
         SegmentBuffer buffer = segment.getBuffer();
         LeafAlloc leafAlloc;
+        // 每次重启服务，不管上次分配的字段是否使用完毕，这里都会重新分配一个字段范围
         if (!buffer.isInitOk()) {
+            // 更新数据库中的max_id
             leafAlloc = dao.updateMaxIdAndGetLeafAlloc(key);
             buffer.setStep(leafAlloc.getStep());
             buffer.setMinStep(leafAlloc.getStep());//leafAlloc中的step为DB中的step
@@ -201,16 +203,21 @@ public class SegmentIDGenImpl implements IDGen {
 
     public Result getIdFromSegmentBuffer(final SegmentBuffer buffer) {
         while (true) {
+            // 加读锁
             buffer.rLock().lock();
             try {
                 final Segment segment = buffer.getCurrent();
+                // 下一个buffer的读取是没有准备好 && 空闲的自号段小于50% && 线程没有在运行
                 if (!buffer.isNextReady() && (segment.getIdle() < 0.9 * segment.getStep()) && buffer.getThreadRunning().compareAndSet(false, true)) {
+                    // 线程池执行给双buffer中没有使用的buffer分配字号
                     service.execute(new Runnable() {
                         @Override
                         public void run() {
+                            // 拿到下一个segment
                             Segment next = buffer.getSegments()[buffer.nextPos()];
                             boolean updateOk = false;
                             try {
+                                // 分配字号
                                 updateSegmentFromDb(buffer.getKey(), next);
                                 updateOk = true;
                                 logger.info("update segment {} from db {}", buffer.getKey(), next);
@@ -218,8 +225,11 @@ public class SegmentIDGenImpl implements IDGen {
                                 logger.warn(buffer.getKey() + " updateSegmentFromDb exception", e);
                             } finally {
                                 if (updateOk) {
+                                    // 分配成功，加写锁
                                     buffer.wLock().lock();
+                                    // 设置buffer中下一个缓存字号准备好了
                                     buffer.setNextReady(true);
+                                    // 线程没有正在运行
                                     buffer.getThreadRunning().set(false);
                                     buffer.wLock().unlock();
                                 } else {
@@ -236,16 +246,21 @@ public class SegmentIDGenImpl implements IDGen {
             } finally {
                 buffer.rLock().unlock();
             }
+            // 代码走到这里原因：线程正在给另一个缓存自号段分配字号，还没分配好，这里等待一下
             waitAndSleep(buffer);
             buffer.wLock().lock();
             try {
+                // 拿到当前的自号段，这个自号段并不是线程更新的哪个自号段
                 final Segment segment = buffer.getCurrent();
                 long value = segment.getValue().getAndIncrement();
                 if (value < segment.getMax()) {
                     return new Result(value, Status.SUCCESS);
                 }
+                // 走到这里说明：正在使用的自号段用完了。
                 if (buffer.isNextReady()) {
+                    // 切换使用另一个自号段
                     buffer.switchPos();
+                    // 循环使用双自号段。设置另一个自号段为没准备好状态
                     buffer.setNextReady(false);
                 } else {
                     logger.error("Both two segments in {} are not ready!", buffer);
@@ -254,6 +269,7 @@ public class SegmentIDGenImpl implements IDGen {
             } finally {
                 buffer.wLock().unlock();
             }
+            // 这里没有返回一个Result，注意看上面代码是一个while(true)
         }
     }
 
